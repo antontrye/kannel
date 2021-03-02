@@ -206,87 +206,84 @@ void bb_smscconn_killed(void)
 }
 
 
-static void handle_split(SMSCConn *conn, Msg *msg, long reason)
+static void handle_split(SMSCConn *conn, Msg *msg, long reason, Octstr *reply)
 {
     struct split_parts *split = msg->sms.split_parts;
-    
+
     /*
      * if the reason is not a success and status is still success
      * then set status of a split to the reason.
      * Note: reason 'malformed','discarded' or 'rejected' has higher priority!
      */
     switch(reason) {
-    case SMSCCONN_FAILED_TEMPORARILY:
-        /*
-         * Check if SMSC link alive and if so increase resend_try and set resend_time.
-         * If SMSC link is not active don't increase resend_try and don't set resend_time
-         * because we don't want to delay messages due to broken connection.
-         */
-        if (smscconn_status(conn) == SMSCCONN_ACTIVE) {
+        case SMSCCONN_FAILED_TEMPORARILY:
             /*
-             * Check if sms_resend_retry set and this msg has exceeded a limit also
-             * honor "single shot" with sms_resend_retry set to zero.
+             * Check if SMSC link alive and if so increase resend_try and set resend_time.
+             * If SMSC link is not active don't increase resend_try and don't set resend_time
+             * because we don't want to delay messages due to broken connection.
              */
-            if (sms_resend_retry >= 0 && msg->sms.resend_try >= sms_resend_retry) {
-                warning(0, "Maximum retries for message exceeded, discarding it!");
-                bb_smscconn_send_failed(NULL, msg, SMSCCONN_FAILED_DISCARDED,
-                                        octstr_create("Retries Exceeded"));
-                return;
+            if (smscconn_status(conn) == SMSCCONN_ACTIVE) {
+                /*
+                 * Check if sms_resend_retry set and this msg has exceeded a limit also
+                 * honor "single shot" with sms_resend_retry set to zero.
+                 */
+                if (sms_resend_retry >= 0 && msg->sms.resend_try >= sms_resend_retry) {
+                    warning(0, "Maximum retries for message exceeded, discarding it!");
+                    bb_smscconn_send_failed(NULL, msg, SMSCCONN_FAILED_DISCARDED,
+                                            octstr_create("Retries Exceeded"));
+                    return;
+                }
+                msg->sms.resend_try = (msg->sms.resend_try > 0 ? msg->sms.resend_try + 1 : 1);
+                time(&msg->sms.resend_time);
             }
-            msg->sms.resend_try = (msg->sms.resend_try > 0 ? msg->sms.resend_try + 1 : 1);
-            time(&msg->sms.resend_time);
-        }
-        gwlist_produce(outgoing_sms, msg);
-        return;
-    case SMSCCONN_FAILED_DISCARDED:
-    case SMSCCONN_FAILED_REJECTED:
-    case SMSCCONN_FAILED_MALFORMED:
-        debug("bb.sms.splits", 0, "Set split msg status to %ld", reason);
-        split->status = reason;
-        break;
-    case SMSCCONN_SUCCESS:
-        break; /* nothing todo */
-    default:
-        if (split->status == SMSCCONN_SUCCESS) {
+            gwlist_produce(outgoing_sms, msg);
+            return;
+        case SMSCCONN_FAILED_DISCARDED:
+        case SMSCCONN_FAILED_REJECTED:
+        case SMSCCONN_FAILED_MALFORMED:
             debug("bb.sms.splits", 0, "Set split msg status to %ld", reason);
             split->status = reason;
-        }
-        break;
+            break;
+        case SMSCCONN_SUCCESS:
+            break; /* nothing todo */
+        default:
+            if (split->status == SMSCCONN_SUCCESS) {
+                debug("bb.sms.splits", 0, "Set split msg status to %ld", reason);
+                split->status = reason;
+            }
+            break;
     }
-
     /*
      * now destroy this message, because we don't need it anymore.
      * we will split it again in smscconn_send(...).
      */
     msg_destroy(msg);
-        
+
     if (counter_decrease(split->parts_left) <= 1) {
         /* all splited parts were processed */
         counter_destroy(split->parts_left);
         msg = split->orig;
         msg->sms.split_parts = NULL;
         if (split->status == SMSCCONN_SUCCESS)
-            bb_smscconn_sent(conn, msg, NULL);
+            bb_smscconn_sent(conn, msg, reply);
         else {
             debug("bb.sms.splits", 0, "Parts of concatenated message failed.");
-            bb_smscconn_send_failed(conn, msg, split->status, NULL);
+            bb_smscconn_send_failed(conn, msg, split->status, reply);
         }
         gw_free(split);
+    } else {
+        octstr_destroy(reply);
     }
 }
-
 
 void bb_smscconn_sent(SMSCConn *conn, Msg *sms, Octstr *reply)
 {
     if (sms->sms.split_parts != NULL) {
-        handle_split(conn, sms, SMSCCONN_SUCCESS);
-        octstr_destroy(reply);
+        handle_split(conn, sms, SMSCCONN_SUCCESS, reply);
         return;
     }
-
     /* write ACK to store file */
     store_save_ack(sms, ack_success);
-
     if (sms->sms.sms_type != report_mt) {
         bb_alog_sms(conn, sms, "Sent SMS");
         counter_increase(outgoing_sms_counter);
@@ -304,113 +301,99 @@ void bb_smscconn_sent(SMSCConn *conn, Msg *sms, Octstr *reply)
             load_increase(conn->outgoing_dlr_load);
         }
     }
-
     /* generate relay confirmancy message */
     if (DLR_IS_SMSC_SUCCESS(sms->sms.dlr_mask)) {
         Msg *dlrmsg;
-
-	if (reply == NULL)
-	    reply = octstr_create("");
-
-	octstr_insert_data(reply, 0, "ACK/", 4);
+        if (reply == NULL)
+            reply = octstr_create("");
+        octstr_insert_data(reply, 0, "ACK/", 4);
         dlrmsg = create_dlr_from_msg((conn->id?conn->id:conn->name), sms,
-	                reply, DLR_SMSC_SUCCESS);
+                                     reply, DLR_SMSC_SUCCESS);
         if (dlrmsg != NULL) {
             bb_smscconn_receive(conn, dlrmsg);
         }
     }
-
     msg_destroy(sms);
     octstr_destroy(reply);
 }
 
-
 void bb_smscconn_send_failed(SMSCConn *conn, Msg *sms, int reason, Octstr *reply)
 {
     if (sms->sms.split_parts != NULL) {
-        handle_split(conn, sms, reason);
-        octstr_destroy(reply);
+        handle_split(conn, sms, reason, reply);
         return;
     }
-    
+
     switch (reason) {
-    case SMSCCONN_FAILED_TEMPORARILY:
-        /*
-         * Check if SMSC link alive and if so increase resend_try and set resend_time.
-         * If SMSC link is not active don't increase resend_try and don't set resend_time
-         * because we don't want to delay messages due to a broken connection.
-         */
-       if (conn && smscconn_status(conn) == SMSCCONN_ACTIVE) {
+        case SMSCCONN_FAILED_TEMPORARILY:
             /*
-             * Check if sms_resend_retry set and this msg has exceeded a limit also
-             * honor "single shot" with sms_resend_retry set to zero.
+             * Check if SMSC link alive and if so increase resend_try and set resend_time.
+             * If SMSC link is not active don't increase resend_try and don't set resend_time
+             * because we don't want to delay messages due to a broken connection.
              */
-           if (sms_resend_retry >= 0 && sms->sms.resend_try >= sms_resend_retry) {
-               warning(0, "Maximum retries for message exceeded, discarding it!");
-               bb_smscconn_send_failed(NULL, sms, SMSCCONN_FAILED_DISCARDED, 
-                                       octstr_create("Retries Exceeded"));
-               break;
-           }
-           sms->sms.resend_try = (sms->sms.resend_try > 0 ? sms->sms.resend_try + 1 : 1);
-           time(&sms->sms.resend_time);
-       }
-       gwlist_produce(outgoing_sms, sms);
-       break;
-       
-    case SMSCCONN_FAILED_SHUTDOWN:
-        gwlist_produce(outgoing_sms, sms);
-        break;
-
-    default:
-        /* write NACK to store file */
-        store_save_ack(sms, ack_failed);
-
-        if (conn) counter_increase(conn->failed);
-        if (reason == SMSCCONN_FAILED_DISCARDED) {
-            if (sms->sms.sms_type != report_mt)
-                bb_alog_sms(conn, sms, "DISCARDED SMS");
-            else
-                bb_alog_sms(conn, sms, "DISCARDED DLR");
-        }
-        else if (reason == SMSCCONN_FAILED_EXPIRED) {
-            if (sms->sms.sms_type != report_mt)
-                bb_alog_sms(conn, sms, "EXPIRED SMS");
-            else
-                bb_alog_sms(conn, sms, "EXPIRED DLR");
-        }
-        else if (reason == SMSCCONN_FAILED_REJECTED) {
-            if (sms->sms.sms_type != report_mt)
-                bb_alog_sms(conn, sms, "REJECTED Send SMS");
-            else
-                bb_alog_sms(conn, sms, "REJECTED Send DLR");
-        }
-        else {
-            if (sms->sms.sms_type != report_mt)
-                bb_alog_sms(conn, sms, "FAILED Send SMS");
-            else
-                bb_alog_sms(conn, sms, "FAILED Send DLR");
-        }
-
-        /* generate relay confirmancy message */
-        if (DLR_IS_SMSC_FAIL(sms->sms.dlr_mask) ||
-	    DLR_IS_FAIL(sms->sms.dlr_mask)) {
-            Msg *dlrmsg;
-
-	    if (reply == NULL)
-	        reply = octstr_create("");
-
-	    octstr_insert_data(reply, 0, "NACK/", 5);
-            dlrmsg = create_dlr_from_msg((conn ? (conn->id?conn->id:conn->name) : NULL), sms,
-	                                 reply, DLR_SMSC_FAIL);
-            if (dlrmsg != NULL) {
-                bb_smscconn_receive(conn, dlrmsg);
+            if (conn && smscconn_status(conn) == SMSCCONN_ACTIVE) {
+                /*
+                 * Check if sms_resend_retry set and this msg has exceeded a limit also
+                 * honor "single shot" with sms_resend_retry set to zero.
+                 */
+                if (sms_resend_retry >= 0 && sms->sms.resend_try >= sms_resend_retry) {
+                    warning(0, "Maximum retries for message exceeded, discarding it!");
+                    bb_smscconn_send_failed(NULL, sms, SMSCCONN_FAILED_DISCARDED,
+                                            octstr_create("Retries Exceeded"));
+                    break;
+                }
+                sms->sms.resend_try = (sms->sms.resend_try > 0 ? sms->sms.resend_try + 1 : 1);
+                time(&sms->sms.resend_time);
             }
-        }
+            gwlist_produce(outgoing_sms, sms);
+            break;
 
-        msg_destroy(sms);
-        break;
+        case SMSCCONN_FAILED_SHUTDOWN:
+            gwlist_produce(outgoing_sms, sms);
+            break;
+        default:
+            /* write NACK to store file */
+            store_save_ack(sms, ack_failed);
+            if (conn) counter_increase(conn->failed);
+            if (reason == SMSCCONN_FAILED_DISCARDED) {
+                if (sms->sms.sms_type != report_mt)
+                    bb_alog_sms(conn, sms, "DISCARDED SMS");
+                else
+                    bb_alog_sms(conn, sms, "DISCARDED DLR");
+            }
+            else if (reason == SMSCCONN_FAILED_EXPIRED) {
+                if (sms->sms.sms_type != report_mt)
+                    bb_alog_sms(conn, sms, "EXPIRED SMS");
+                else
+                    bb_alog_sms(conn, sms, "EXPIRED DLR");
+            }
+            else if (reason == SMSCCONN_FAILED_REJECTED) {
+                if (sms->sms.sms_type != report_mt)
+                    bb_alog_sms(conn, sms, "REJECTED Send SMS");
+                else
+                    bb_alog_sms(conn, sms, "REJECTED Send DLR");
+            }
+            else {
+                if (sms->sms.sms_type != report_mt)
+                    bb_alog_sms(conn, sms, "FAILED Send SMS");
+                else
+                    bb_alog_sms(conn, sms, "FAILED Send DLR");
+            }
+            /* generate relay confirmancy message */
+            if (DLR_IS_SMSC_FAIL(sms->sms.dlr_mask) || DLR_IS_FAIL(sms->sms.dlr_mask)) {
+                Msg *dlrmsg;
+                if (reply == NULL)
+                    reply = octstr_create("");
+                octstr_insert_data(reply, 0, "NACK/", 5);
+                dlrmsg = create_dlr_from_msg((conn ? (conn->id?conn->id:conn->name) : NULL), sms,
+                                             reply, DLR_SMSC_FAIL);
+                if (dlrmsg != NULL) {
+                    bb_smscconn_receive(conn, dlrmsg);
+                }
+            }
+            msg_destroy(sms);
+            break;
     }
-
     octstr_destroy(reply);
 }
 
